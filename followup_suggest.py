@@ -30,11 +30,18 @@ PROMPT_TEMPLATE = """You are a follow-up query recommender for an AI coding assi
 Based on the conversation context, generate exactly 3 short follow-up queries the user might want to ask next.
 
 Rules:
-- Each query must be concise, in the SAME language as the conversation.
-- Queries should be directly actionable next steps related to the last assistant response.
+- Each query must be concise, in the SAME language as the conversation (Chinese in, Chinese out).
+- Queries must start with an action verb and point to a SPECIFIC next step from the response (like "继续 Phase 3 重构 tools/ 目录"), NOT generic open questions (avoid "如何/能否/可以吗" phrasing).
 - If a file context is given, at least one query may relate to it.
 - Output ONLY a single JSON object (no markdown, no extra text) with exactly 3 items:
 {{"queries": ["...", "...", "..."]}}
+
+Example (real production behavior):
+Context: assistant just finished MITM capture analysis and plans to replay captured LLM requests
+Good output: {{"queries": ["继续深挖已捕获的 SSE 流量，提取完整 prompt", "帮我回放 mitm.flows 里的真实请求", "把抓包分析结果整理成文档"]}}
+Bad output: {{"queries": ["如何分析流量？", "能否介绍 mitmproxy？", "抓包有什么用途？"]}}
+
+CRITICAL: The 3 queries MUST be written in {language}, regardless of the example above.
 
 User input history (newest last):
 {user_input_history}
@@ -44,6 +51,21 @@ Last assistant response:
 
 Active file (if any): {active_file}
 """
+
+
+def detect_language(texts) -> str:
+    """按 CJK 字符占比判定对话语言，注入 prompt 增强语言跟随。
+    技术对话常混大量英文标识符，因此汉字只需达到较低比例即判中文。"""
+    cjk = ascii_ = 0
+    for t in texts:
+        for ch in (t or ""):
+            if "\u4e00" <= ch <= "\u9fff":
+                cjk += 1
+            elif ch.isascii() and ch.isalpha():
+                ascii_ += 1
+    if cjk == 0:
+        return "English" if ascii_ else "unknown"
+    return "Chinese" if cjk * 4 >= ascii_ else "English"
 
 
 def build_prompt(ctx: dict) -> str:
@@ -67,29 +89,43 @@ def build_prompt(ctx: dict) -> str:
         active = f"{fname}\n```\n{file_content[:MAX_FILE_CHARS]}\n```"
 
     return PROMPT_TEMPLATE.format(
+        language=detect_language([*history, reply]),
         user_input_history=history_str,
         last_assistant_response=reply,
         active_file=active,
     )
 
 
-def suggest(ctx: dict) -> list:
+def suggest(ctx: dict, _retry: bool = False) -> list:
     prompt = build_prompt(ctx)
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "format": "json",   # Ollama JSON 约束模式
-        "options": {"temperature": 0.7, "num_predict": 256},
+        "think": False,     # 禁用 qwen3 思考模式 (避免 thinking 耗尽 token 配额)
+        "options": {"temperature": 0.7 if not _retry else 0.2, "num_predict": 256},
     }
     req = urllib.request.Request(
         OLLAMA_URL,
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        resp = json.loads(r.read())
-    text = resp["message"]["content"].strip()
+    timeout = 120 if "mistral" in MODEL or "qwen" not in MODEL else 300
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError:
+        # 老版本 Ollama 不认识 think 字段, 移除后重试
+        payload.pop("think", None)
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+    text = (resp["message"].get("content") or "").strip()
     # 解析 JSON (兼容 {"queries":[...]}、数组、或 markdown 包裹)
     try:
         out = json.loads(text)
@@ -106,6 +142,9 @@ def suggest(ctx: dict) -> list:
             queries.append(item.get("query") or item.get("question") or str(item))
         elif isinstance(item, str):
             queries.append(item)
+    # 解析失败或为空时降温度重试一次
+    if not queries and not _retry:
+        return suggest(ctx, _retry=True)
     return queries
 
 
