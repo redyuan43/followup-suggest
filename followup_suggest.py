@@ -45,11 +45,7 @@ Rules:
 {{"queries": ["...", "...", "..."]}}
 
 Example (real production behavior):
-Context: assistant just finished MITM capture analysis and plans to replay captured LLM requests
-Good output: {{"queries": ["继续深挖已捕获的 SSE 流量，提取完整 prompt", "帮我回放 mitm.flows 里的真实请求", "把抓包分析结果整理成文档"]}}
-Bad output: {{"queries": ["如何分析流量？", "能否介绍 mitmproxy？", "抓包有什么用途？"]}}
-
-CRITICAL: The 3 queries MUST be written in {language}, regardless of the example above.
+{example}
 
 User input history (newest last):
 {user_input_history}
@@ -59,6 +55,16 @@ Last assistant response:
 
 Active file (if any): {active_file}
 """
+
+# 按语言切换 few-shot 示例 (固定中文示例会压过语言指令, 导致英文对话输出中文)
+EXAMPLES = {
+    "Chinese": """Context: assistant just finished MITM capture analysis and plans to replay captured LLM requests
+Good output: {{"queries": ["继续深挖已捕获的 SSE 流量，提取完整 prompt", "帮我回放 mitm.flows 里的真实请求", "把抓包分析结果整理成文档"]}}
+Bad output: {{"queries": ["如何分析流量？", "能否介绍 mitmproxy？", "抓包有什么用途？"]}}""",
+    "English": """Context: assistant just finished MITM capture analysis and plans to replay captured LLM requests
+Good output: {{"queries": ["Continue digging into the captured SSE streams to extract full prompts", "Replay the real requests from mitm.flows", "Turn the capture analysis into a document"]}}
+Bad output: {{"queries": ["How to analyze traffic?", "Can you introduce mitmproxy?", "What is packet capture used for?"]}}""",
+}
 
 
 def detect_language(texts) -> str:
@@ -96,8 +102,9 @@ def build_prompt(ctx: dict) -> str:
     if file_content and len(file_content) < MAX_FILE_CHARS:
         active = f"{fname}\n```\n{file_content[:MAX_FILE_CHARS]}\n```"
 
+    language = detect_language([*history, reply])
     return PROMPT_TEMPLATE.format(
-        language=detect_language([*history, reply]),
+        example=EXAMPLES.get(language, EXAMPLES["Chinese"]),
         user_input_history=history_str,
         last_assistant_response=reply,
         active_file=active,
@@ -113,8 +120,17 @@ def suggest(ctx: dict, _retry: bool = False) -> list:
     return parse_queries(text, ctx, _retry)
 
 
+class BackendError(Exception):
+    """后端调用失败, message 含定位提示"""
+
+
 def call_ds_flash(prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> str:
     """调用 Trae 官方同款 DeepSeek-V4-Flash (OpenAI 兼容接口)"""
+    if not DS_FLASH_KEY:
+        raise BackendError(
+            "未设置 DS_FLASH_KEY 环境变量 (代理服务的 API key)。\n"
+            "  提示: key 位于代理服务机器的 .env 文件 (API_KEY=... 行)"
+        )
     payload = {
         "model": DS_FLASH_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -123,13 +139,39 @@ def call_ds_flash(prompt: str, max_tokens: int = 256, temperature: float = 0.7) 
         "temperature": temperature,
         "response_format": {"type": "json_object"},
     }
-    headers = {"Content-Type": "application/json"}
-    if DS_FLASH_KEY:
-        headers["Authorization"] = f"Bearer {DS_FLASH_KEY}"
-    req = urllib.request.Request(DS_FLASH_URL, data=json.dumps(payload).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=120) as r:
-        resp = json.loads(r.read())
-    return (resp["choices"][0]["message"].get("content") or "").strip()
+    req = urllib.request.Request(
+        DS_FLASH_URL,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {DS_FLASH_KEY}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        hint = {
+            401: "key 无效, 检查 DS_FLASH_KEY 是否与代理服务 .env 中的一致",
+            404: "路径不对, 检查 DS_FLASH_URL",
+            502: "代理服务无法连通上游, 检查代理服务日志",
+        }.get(e.code, f"HTTP {e.code}")
+        raise BackendError(f"ds-flash 请求失败: {hint}") from e
+    except urllib.error.URLError as e:
+        raise BackendError(
+            f"无法连接 {DS_FLASH_URL}: {e.reason}\n"
+            f"  排查: 1) SSH 隧道是否存活: ssh -f -N -L 19220:127.0.0.1:9220 YOUR_SERVER\n"
+            f"        2) 验证: curl -m 5 http://127.0.0.1:19220/v1/status -H 'Authorization: Bearer $DS_FLASH_KEY'"
+        ) from e
+    except TimeoutError:
+        raise BackendError("ds-flash 请求超时 (60s), 上游响应过慢或隧道不稳") from None
+    try:
+        resp = json.loads(raw)
+        text = (resp["choices"][0]["message"].get("content") or "").strip()
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        preview = raw[:200].decode("utf-8", "replace")
+        raise BackendError(f"ds-flash 响应异常 (非标准 OpenAI 格式): {preview}") from e
+    if not text:
+        raise BackendError("ds-flash 返回空 content, 可能被内容过滤拦截")
+    return text
 
 
 def call_ollama(prompt: str, _retry: bool) -> str:
@@ -206,7 +248,8 @@ def replay(flows_path: str):
             print(f"  Trae 原始建议(deepseek_v4_flash): {orig_text[:200]}")
             # 本地模型复刻
             queries = suggest(variables)
-            print(f"  本地复刻建议({MODEL}):")
+            backend_label = "ds-flash" if BACKEND == "ds-flash" else MODEL
+            print(f"  本地复刻建议({backend_label}):")
             for q in queries:
                 print(f"    - {q}")
             n += 1
@@ -236,7 +279,11 @@ def main():
     else:
         raw = sys.stdin.read()
         ctx = json.loads(raw) if raw.strip() else {}
-    queries = suggest(ctx)
+    try:
+        queries = suggest(ctx)
+    except BackendError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
     print(json.dumps(queries, ensure_ascii=False, indent=2))
 
 
