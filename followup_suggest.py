@@ -17,11 +17,19 @@
 """
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.request
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+# Trae 官方同款模型后端 (OpenAI 兼容, 经 SSH 隧道转发 AMD 上的 trae_cn 代理服务):
+#   ssh -f -N -L 19220:127.0.0.1:9220 AMD
+DS_FLASH_URL = os.environ.get("DS_FLASH_URL", "http://127.0.0.1:19220/v1/chat/completions")
+DS_FLASH_MODEL = os.environ.get("DS_FLASH_MODEL", "DeepSeek-V4-Flash-Official")
+DS_FLASH_KEY = os.environ.get("DS_FLASH_KEY", "")
+
+BACKEND = "ollama"  # "ollama" | "ds-flash"
 MODEL = "mistral:latest"  # 本地轻量模型; Trae 用的是 deepseek_v4_flash 级别
 MAX_REPLY_CHARS = 3000    # Trae 对 last_assistant_response 做了截断
 MAX_FILE_CHARS = 4000
@@ -98,6 +106,33 @@ def build_prompt(ctx: dict) -> str:
 
 def suggest(ctx: dict, _retry: bool = False) -> list:
     prompt = build_prompt(ctx)
+    if BACKEND == "ds-flash":
+        text = call_ds_flash(prompt, max_tokens=256, temperature=0.7 if not _retry else 0.2)
+    else:
+        text = call_ollama(prompt, _retry)
+    return parse_queries(text, ctx, _retry)
+
+
+def call_ds_flash(prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> str:
+    """调用 Trae 官方同款 DeepSeek-V4-Flash (OpenAI 兼容接口)"""
+    payload = {
+        "model": DS_FLASH_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Content-Type": "application/json"}
+    if DS_FLASH_KEY:
+        headers["Authorization"] = f"Bearer {DS_FLASH_KEY}"
+    req = urllib.request.Request(DS_FLASH_URL, data=json.dumps(payload).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=120) as r:
+        resp = json.loads(r.read())
+    return (resp["choices"][0]["message"].get("content") or "").strip()
+
+
+def call_ollama(prompt: str, _retry: bool) -> str:
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -125,7 +160,10 @@ def suggest(ctx: dict, _retry: bool = False) -> list:
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             resp = json.loads(r.read())
-    text = (resp["message"].get("content") or "").strip()
+    return (resp["message"].get("content") or "").strip()
+
+
+def parse_queries(text: str, ctx: dict, _retry: bool) -> list:
     # 解析 JSON (兼容 {"queries":[...]}、数组、或 markdown 包裹)
     try:
         out = json.loads(text)
@@ -181,8 +219,11 @@ def main():
     ap.add_argument("--replay", metavar="FLOWS", help="回放 mitm.flows 中的真实请求")
     ap.add_argument("--last-reply", help="最后一条助手回复(简单模式)")
     ap.add_argument("--model", default=MODEL, help=f"Ollama 模型 (默认 {MODEL})")
+    ap.add_argument("--backend", choices=["ollama", "ds-flash"], default=BACKEND,
+                    help="后端: ollama=本地模型, ds-flash=Trae 官方同款 DeepSeek-V4-Flash")
     args = ap.parse_args()
 
+    globals()["BACKEND"] = args.backend
     if args.model != MODEL:
         globals()["MODEL"] = args.model
 
