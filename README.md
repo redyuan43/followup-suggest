@@ -38,7 +38,34 @@ echo '{"user_input_history": ["你好"], "last_assistant_response": "..."}' | py
 
 # 指定模型
 python3 followup_suggest.py --last-reply "..." --model qwen3:32b
+
+# 使用 Trae 官方同款 DeepSeek-V4-Flash 后端 (需 SSH 隧道, 见下节)
+DS_FLASH_KEY=YOUR_KEY python3 followup_suggest.py --last-reply "..." --backend ds-flash
 ```
+
+### ds-flash 后端（Trae 官方同款模型）
+
+延迟约 3-4s，输出质量与 Trae 官方建议基本一致。链路：
+
+```
+followup_suggest.py → 127.0.0.1:19220 (SSH 隧道)
+  → 代理服务 :9220 (OpenAI 兼容) → Trae 官方 API → deepseek-v4-flash
+```
+
+准备步骤：
+
+1. 在代理服务所在机器上启动 OpenAI 兼容服务（监听 127.0.0.1:9220）
+2. 建立 SSH 隧道：`ssh -f -N -L 19220:127.0.0.1:9220 YOUR_SERVER`
+3. 设置环境变量：
+
+```bash
+export DS_FLASH_KEY=YOUR_API_KEY          # 必需
+# 可选覆盖:
+# export DS_FLASH_URL=http://127.0.0.1:19220/v1/chat/completions
+# export DS_FLASH_MODEL=DeepSeek-V4-Flash-Official
+```
+
+**注意**：API key 只通过环境变量传入，不要写入代码或提交到仓库。
 
 输出：
 
@@ -64,13 +91,14 @@ queries = suggest({
 
 ## 与官方实现的对比
 
-| 维度 | Trae 官方 | 本复刻 |
-|---|---|---|
-| 模型 | deepseek_v4_flash_official | 本地任意小模型 |
-| 端点 | 云端 API (明文 JSON) | 本地 Ollama |
-| 输入 | 历史输入+最后回复+当前文件 | 相同 |
-| 输出 | `[{"query": ...}]` × 3 | `{"queries": [...]}` × 3 |
-| 单次成本 | ~1762 tokens | 本地推理 |
+| 维度 | Trae 官方 | 本复刻 (ollama) | 本复刻 (ds-flash) |
+|---|---|---|---|
+| 模型 | deepseek_v4_flash_official | 本地任意小模型 | 同官方 |
+| 端点 | 云端 API (明文 JSON) | 本地 Ollama | Trae 官方 API 经代理 |
+| 延迟 | ~1-2s | 10-50s (视模型) | ~3-4s |
+| 输入 | 历史输入+最后回复+当前文件 | 相同 | 相同 |
+| 输出 | `[{"query": ...}]` × 3 | `{"queries": [...]}` × 3 | 相同 |
+| 单次成本 | ~1762 tokens | 本地推理 | ~1700 tokens |
 
 回放真实流量验证：本地 `mistral:7b` 与官方 `deepseek_v4_flash` 输出语义基本一致
 （均能抓住「继续 Phase 3 重构」等上下文核心）。
